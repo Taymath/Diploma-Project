@@ -569,10 +569,7 @@ def compute_fid_for_models(teacher_pipe, student_unet, prompt, device,
                            num_images=5, num_inference_steps=25, guidance_scale=7.5,
                            teacher_height=512, teacher_width=512,
                            student_height=64, student_width=64):
-    """
-    Генерируем num_images у Teacher (512x512), ресайзим до 64x64,
-    и генерируем num_images у студента (64x64). Считаем FID.
-    """
+
     teacher_dir_full = "fid_teacher_full"
     teacher_dir_resized = "fid_teacher_resized"
     student_dir = "fid_student"
@@ -639,7 +636,6 @@ def main_experiment():
     teacher_pipe.scheduler = DPMSolverMultistepScheduler.from_config(teacher_pipe.scheduler.config)
     print("Teacher loaded.")
 
-    # Dataset: 64x64, up to 20k изображений, batch_size=40
     print("Building dataset...")
     train_dataset = MSCOCODataset(
         img_dir="D:\\MSU\\diploma\\work\\coco2017\\train2017",
@@ -651,8 +647,7 @@ def main_experiment():
     print("Dataset ready.")
 
     teacher_config = dict(teacher_pipe.unet.config)
-
-    # ---- 1) Student (Adaptive init) ----
+    
     print("\n=== 1) Student (Adaptive init) ===")
     student_adaptive = make_student_unet(teacher_config, sample_size=64)
     adaptive_copy_teacher_to_student(teacher_pipe.unet, student_adaptive)
@@ -673,7 +668,6 @@ def main_experiment():
     torch.save(student_adaptive.state_dict(), "student_adaptive.pth")
     print(f"[Adaptive init] Final training loss: {loss_adaptive:.4f}")
 
-    # ---- 2) Student (Random init) ----
     print("\n=== 2) Student (Random init) ===")
     student_random = make_student_unet(teacher_config, sample_size=64)
     student_random.float()  # random init
@@ -724,14 +718,6 @@ def main_experiment():
         student_width=64
     )
     print(f"FID (Random) = {fid_random:.2f}")
-
-    # Оценка CLIP Score для генераций (опционально)
-    # Для примера, можно вычислять CLIP Score для нескольких сгенерированных изображений
-    # clip_score_metric = CLIPScore(model_name_or_path="openai/clip-vit-base-patch32").to(device)
-    # Примерный вызов:
-    # generated_img = sample_with_cfg(student_adaptive, teacher_pipe, prompt_for_fid, device, 25, 7.5, 64, 64)
-    # clip_score_val = clip_score_metric(generated_img, [prompt_for_fid]).mean().item()
-    # print(f"CLIP Score (Adaptive) = {clip_score_val:.4f}")
 
     print("\nDone main_experiment.")
 
