@@ -181,7 +181,6 @@ def _generate(pipeline: StableDiffusionPipeline,
 
 @torch.no_grad()
 def compute_metrics(student_pipe, teacher_pipe, prompts, n_img=8, device="cuda"):
-    """Возвращает (FID, LPIPS)."""
     fid = FrechetInceptionDistance(feature=2048, normalize=True).to(device)
     lpips = LPIPS(net_type='alex').to(device)
 
@@ -211,7 +210,6 @@ def train_student(args, init_mode="custom"):
         gradient_accumulation_steps=1,
     )
 
-    # ---------- компоненты teacher ----------
     teacher_pipe = StableDiffusionPipeline.from_pretrained(
         args.pretrained_model_name_or_path,
         revision=None,
@@ -221,7 +219,6 @@ def train_student(args, init_mode="custom"):
     teacher_pipe.to(accelerator.device)
     teacher_unet = teacher_pipe.unet.eval().requires_grad_(False)
 
-    # ---------- компоненты student ----------
     student_unet = UNet2DConditionModel.from_pretrained(
         args.pretrained_model_name_or_path, subfolder="unet"
     )
@@ -231,24 +228,20 @@ def train_student(args, init_mode="custom"):
     if init_mode == "custom":
         initialize_student_weights(teacher_unet, student_unet)
 
-    # --- неизменные модули ---
     tokenizer = CLIPTokenizer.from_pretrained(args.pretrained_model_name_or_path, subfolder="tokenizer")
     text_encoder = CLIPTextModel.from_pretrained(args.pretrained_model_name_or_path, subfolder="text_encoder")
     vae = AutoencoderKL.from_pretrained(args.pretrained_model_name_or_path, subfolder="vae")
     noise_scheduler = DDPMScheduler.from_pretrained(args.pretrained_model_name_or_path, subfolder="scheduler")
 
-    # --- датасет COCO ----
     from coco_dataset import get_coco_dataloader   # tiny helper ➜ вернёт DataLoader
     train_loader = get_coco_dataloader(args, tokenizer)
 
-    # --- оптимизатор ---
     opt = torch.optim.AdamW(student_unet.parameters(), lr=1e-4)
 
-    # --- ускорения ---
     student_unet, opt, train_loader = accelerator.prepare(
         student_unet, opt, train_loader
     )
-    # Если мы в fp16 — приводим VAE и текст-энкодер к half, чтобы совпадал тип входа и bias
+
     if accelerator.mixed_precision == "fp16":
         vae.to(accelerator.device)
         vae.half()
@@ -257,10 +250,8 @@ def train_student(args, init_mode="custom"):
 
     scaler = GradScaler(enabled=accelerator.mixed_precision == "fp16")
 
-    # --- для быстрой FID оценки ---
     fid_prompts = ["a photo of a cat", "a city skyline at sunset"]
 
-    # --------------------------------------------------------
     from tqdm.auto import tqdm
     import torch.nn.functional as F
     feature_extractor = CLIPFeatureExtractor.from_pretrained(
@@ -268,7 +259,6 @@ def train_student(args, init_mode="custom"):
         subfolder="feature_extractor",
         revision=args.revision,
     )
-    # внутри вашей функции train_student, после подготовки моделей и оптимизатора:
     global_step = 0
     for epoch in range(args.epochs):
         student_unet.train()
@@ -327,18 +317,15 @@ def train_student(args, init_mode="custom"):
                                               fid_prompts, n_img=4, device=accelerator.device)
                     accelerator.print(f"[{init_mode}] step {global_step}: FID={fid:.2f}, LPIPS={lp:.3f}")
 
-                    # экономим память
                     del student_pipe
                     torch.cuda.empty_cache()
 
-                # ---------- save state ----------
                 if global_step % 1000 == 0 and accelerator.is_main_process:
                     save_dir = Path(args.output_dir, f"{init_mode}_ckpt_{global_step}")
                     accelerator.save_state(save_dir)
 
         if done: break
 
-        # ---------- 3 sample images в конце эпохи ----------
         if accelerator.is_main_process:
             student_pipe = StableDiffusionPipeline(
                 vae=vae, text_encoder=text_encoder,
@@ -355,7 +342,6 @@ def train_student(args, init_mode="custom"):
             del student_pipe
             torch.cuda.empty_cache()
 
-    # --- финальный pipeline для сравнения ---
     return accelerator.unwrap_model(student_unet)
 
 
@@ -370,17 +356,14 @@ def evaluate_inits(args):
         gradient_accumulation_steps=1,
     )
 
-    # ------------ RANDOM -------------
     log.info(">> RANDOM init")
     rnd_student = train_student(args, init_mode="random")
     torch.cuda.empty_cache() ; gc.collect()
 
-    # ------------ CUSTOM -------------
     log.info(">> CUSTOM init")
     custom_student = train_student(args, init_mode="custom")
     torch.cuda.empty_cache() ; gc.collect()
 
-    # ------------ FID сравнение -------------
     teacher_pipe = StableDiffusionPipeline.from_pretrained(
         args.pretrained_model_name_or_path, torch_dtype=torch.float16,
         safety_checker=None).to(accelerator.device)
@@ -406,7 +389,6 @@ def evaluate_inits(args):
     if fid_cus < fid_rnd:
         log.info("🎉  Custom init превосходит случайную!")
 
-    # --- сохраняем готовую модель ---
     if accelerator.is_main_process:
         Path(args.output_dir, "final").mkdir(parents=True, exist_ok=True)
         cus_pipe.save_pretrained(Path(args.output_dir, "final"))
