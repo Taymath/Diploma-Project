@@ -407,7 +407,6 @@ def compute_fid(pipe, student, prompt, device, n=5, steps=25):
 def main_experiment():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-    # Load teacher
     pipe = StableDiffusionPipeline.from_pretrained(
         "runwayml/stable-diffusion-v1-5",
         torch_dtype=torch.float16,
@@ -415,7 +414,6 @@ def main_experiment():
     ).to(device)
     pipe.scheduler = DDPMScheduler.from_config(pipe.scheduler.config)
 
-    # Dataset
     ds = MSCOCODataset(
         img_dir='D:/MSU/diploma/work/coco2017/train2017',
         ann_file='D:/MSU/diploma/work/coco2017/annotations/captions_train2017.json',
@@ -426,7 +424,6 @@ def main_experiment():
 
     teacher_cfg = dict(pipe.unet.config)
 
-    # 1) Adaptive init
     print('--- Adaptive init ---')
     student_adapt = make_student_unet(teacher_cfg, sample_size=64).to(device)
     adaptive_copy_teacher_to_student(pipe.unet, student_adapt)
@@ -439,7 +436,6 @@ def main_experiment():
     )
     torch.save(student_adapt.state_dict(), 'student_adaptive.pth')
 
-    # 2) Random init
     print('--- Random init ---')
     student_rand = make_student_unet(teacher_cfg, sample_size=64).to(device)
     best_r = train_student(
@@ -451,7 +447,6 @@ def main_experiment():
     )
     torch.save(student_rand.state_dict(), 'student_random.pth')
 
-    # Compare FID
     prompt = 'A scenic mountain lake'
     fid_a = compute_fid(pipe, student_adapt, prompt, device)
     print(f"FID Adaptive = {fid_a:.2f}")
