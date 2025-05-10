@@ -1,0 +1,505 @@
+import os
+import torch
+import torch.nn.functional as F
+from torch import nn
+from torch.optim import AdamW
+from torch.utils.data import DataLoader, Dataset
+from torch.cuda.amp import autocast
+from torchvision import transforms
+# Diffusers and Transformers libraries for Stable Diffusion components
+from diffusers import StableDiffusionPipeline, UNet2DConditionModel, AutoencoderKL, DDPMScheduler
+from transformers import CLIPTextModel, CLIPTokenizer
+# Metrics libraries for FID and LPIPS
+from torchmetrics.image.fid import FrechetInceptionDistance
+import lpips  # Learned perceptual image patch similarity library
+from torch.optim.lr_scheduler import OneCycleLR
+from pycocotools.coco import COCO
+from PIL import Image
+import random
+from torch.cuda.amp import GradScaler
+scaler = GradScaler()
+def coco_collate_fn(batch):
+    return {
+        "image":   [item["image"]   for item in batch],
+        "caption": [item["caption"] for item in batch],
+    }
+
+class CocoCaptions64(Dataset):
+    def __init__(self, img_dir, ann_file, shuffle=True, max_samples=40000):
+        self.coco = COCO(ann_file)
+        self.ids  = list(self.coco.imgToAnns.keys())
+        if max_samples:
+            self.ids = self.ids[:max_samples]
+        self.img_dir, self.shuffle = img_dir, shuffle
+        self.tr = transforms.Compose([
+            transforms.Resize(72, Image.BICUBIC),
+            transforms.CenterCrop(64),
+        ])
+    def __len__(self): return len(self.ids)
+    def __getitem__(self, idx):
+        img_id  = self.ids[idx]
+        ann     = self.coco.imgToAnns[img_id]
+        caption = random.choice(ann)["caption"] if self.shuffle else ann[0]["caption"]
+        file    = self.coco.loadImgs(img_id)[0]["file_name"]
+        img     = Image.open(os.path.join(self.img_dir, file)).convert("RGB")
+        img     = self.tr(img)
+        return {"image": img, "caption": caption}
+
+IMG_DIR  = r"D:\MSU\diploma\work\coco2017\train2017"
+ANN_FILE = r"D:\MSU\diploma\work\coco2017\annotations\captions_train2017.json"
+os.makedirs("output/random", exist_ok=True)
+os.makedirs("output/custom", exist_ok=True)
+
+
+dataset    = CocoCaptions64(IMG_DIR, ANN_FILE)
+dataloader = DataLoader(dataset, batch_size=20, shuffle=True,
+                        num_workers=0, pin_memory=True, drop_last=True, collate_fn=coco_collate_fn)
+
+
+# Configurations
+teacher_model_id = "runwayml/stable-diffusion-v1-5"  # Stable Diffusion v1.5 model id
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+num_train_timesteps = 1000  # number of diffusion steps (Stable Diffusion uses 1000)
+
+# Load teacher Stable Diffusion pipeline (half precision to fit in memory)
+teacher_pipe = StableDiffusionPipeline.from_pretrained(
+    teacher_model_id,
+    torch_dtype=torch.float16,
+    safety_checker=None
+).to(device)
+teacher_pipe.enable_attention_slicing()
+teacher_pipe.vae.half()
+teacher_unet = teacher_pipe.unet
+teacher_vae = teacher_pipe.vae
+teacher_text_encoder = teacher_pipe.text_encoder
+tokenizer = teacher_pipe.tokenizer
+
+teacher_unet.eval()
+teacher_vae.eval()
+teacher_text_encoder.eval()
+
+
+def create_student_model():
+    student_channels = [256, 512, 512]
+    student_down_blocks = ["CrossAttnDownBlock2D", "CrossAttnDownBlock2D", "CrossAttnDownBlock2D"]
+    student_up_blocks   = ["CrossAttnUpBlock2D", "CrossAttnUpBlock2D", "CrossAttnUpBlock2D"]
+    student_config = {
+        "sample_size": 8,
+        "in_channels": 4,
+        "out_channels": 4,
+        "down_block_types": student_down_blocks,
+        "up_block_types": student_up_blocks,
+        "block_out_channels": student_channels,
+        "layers_per_block": 2,
+        "cross_attention_dim": 768,
+        "attention_head_dim": 8,
+    }
+    student_unet = UNet2DConditionModel(**student_config).to(device)
+    return student_unet
+
+def initialize_student_weights(teacher_unet_full, student_unet):
+    """
+    We trim or project teacher weights to student dimensions (using slicing, equivalent to 1x1 conv projections).
+    """
+    teacher_state = teacher_unet_full.state_dict()  # full-precision teacher weights
+    student_state = student_unet.state_dict()
+
+    new_state_dict = {}
+    for name, teacher_weight in teacher_state.items():
+        # Determine corresponding student layer name (adjust indices for dropped/trimmed layers):
+        if name.startswith("down_blocks.3.") or name.startswith("up_blocks.0."):
+            # Skip teacher's last down block (index 3) and first up block (index 0) since student doesn't have those
+            continue
+        # Adjust up block index: teacher up_blocks.1 -> student up_blocks.0, etc.
+        if name.startswith("up_blocks"):
+            # e.g., "up_blocks.1.conv.weight" -> "up_blocks.0.conv.weight"
+            parts = name.split(".")
+            block_idx = int(parts[1])
+            if block_idx == 0:
+                continue  # we already skipped up_blocks.0 above
+            parts[1] = str(block_idx - 1)
+            student_name = ".".join(parts)
+        elif name.startswith("down_blocks"):
+            # Down blocks indices align (0,1,2) since we dropped index 3
+            parts = name.split(".")
+            block_idx = int(parts[1])
+            if block_idx >= 3:
+                continue  # skip teacher down_blocks.3
+            student_name = name  # same name for student
+        else:
+            student_name = name  # e.g., conv_in, time_embedding, mid_block, conv_out, etc.
+
+        if student_name not in student_state:
+            continue  # skip if no corresponding layer in student
+        student_weight = student_state[student_name]
+        # If shapes match, copy directly
+        if teacher_weight.shape == student_weight.shape:
+            new_state_dict[student_name] = teacher_weight.clone()
+        else:
+            # Shapes differ - slice the teacher weight to fit student shape
+            sw = student_weight.shape
+            tw = teacher_weight.shape
+            # For Conv/Linear weights (tensor dim >=2) and biases (dim=1)
+            if teacher_weight.ndim == 4:
+                # Conv weight [out_c, in_c, k, k]
+                out_c, in_c = sw[0], sw[1]
+                new_state_dict[student_name] = teacher_weight[:out_c, :in_c, ...].clone()
+            elif teacher_weight.ndim == 2:
+                # Linear weight [out_c, in_c]
+                out_c, in_c = sw[0], sw[1]
+                new_state_dict[student_name] = teacher_weight[:out_c, :in_c].clone()
+            elif teacher_weight.ndim == 1:
+                # Bias or norm weight [channels]
+                out_c = sw[0]
+                new_state_dict[student_name] = teacher_weight[:out_c].clone()
+    # Load the modified state dict into the student model
+    student_unet.load_state_dict(new_state_dict, strict=False)
+    return student_unet
+
+
+student_unet_random = create_student_model()
+student_unet_custom = create_student_model()
+
+teacher_unet_full = UNet2DConditionModel.from_pretrained(teacher_model_id, subfolder="unet").to("cpu")
+initialize_student_weights(teacher_unet_full, student_unet_custom)
+
+student_unet_random = student_unet_random.to(device)
+student_unet_custom = student_unet_custom.to(device)
+student_unet_random.train()
+student_unet_custom.train()
+
+noise_scheduler = DDPMScheduler(num_train_timesteps=num_train_timesteps, beta_start=0.00085, beta_end=0.0120, beta_schedule="scaled_linear")
+
+def train_student(student_unet, dataloader, optimizer, scheduler, out_dir, epochs=20, log_interval=500):
+    alpha = 0.7
+    fid = FrechetInceptionDistance(feature=2048, normalize=True).to(device)
+    to_tensor01 = transforms.Compose([
+            transforms.Resize((299, 299)),
+            transforms.ToTensor(),
+    ])
+    student_unet.train()
+
+
+    ema_unet = create_student_model().to(device)
+    ema_unet.load_state_dict(student_unet.state_dict())
+    ema_unet.eval()
+    ema_decay = 0.9999
+
+    global_step = 0
+
+    total_steps = epochs * len(dataloader)
+    alpha_start, alpha_end = 1.0, 0.5
+
+    uncond_tokens = tokenizer(
+        [""], padding="max_length", truncation=True, max_length=tokenizer.model_max_length, return_tensors="pt"
+    )
+    with torch.no_grad():
+        uncond_emb = teacher_text_encoder(uncond_tokens.input_ids.to(device), attention_mask=uncond_tokens.attention_mask.to(device)).last_hidden_state.float()
+
+    for epoch in range(epochs):
+        for batch in dataloader:
+            images, captions = batch["image"], batch["caption"]
+
+            images = [transforms.functional.resize(img, (64, 64)) for img in images]
+            images = [transforms.functional.center_crop(img, (64, 64)) for img in images]
+
+            image_tensors = torch.stack([transforms.ToTensor()(img) * 2 - 1 for img in images]).to(device)
+
+            with torch.no_grad():
+                latents_dist = teacher_vae.encode(image_tensors.half())
+                latents = latents_dist.latent_dist.mean * 0.18215
+                latents = latents.float()
+
+            B = latents.size(0)
+            timesteps = torch.randint(
+                0, noise_scheduler.num_train_timesteps,
+                (B,), device=device, dtype=torch.long
+            )
+
+            noise = torch.randn_like(latents)
+            noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
+
+            # Prepare text condition (with 10% dropout for classifier-free guidance)
+            tokenized = tokenizer(list(captions),
+                                  padding="max_length",
+                                  truncation=True,
+                                  max_length=tokenizer.model_max_length,
+                                  return_tensors="pt")
+
+            text_embeddings = teacher_text_encoder(
+                tokenized.input_ids.to(device),
+                attention_mask=tokenized.attention_mask.to(device)
+            ).last_hidden_state.float()
+
+            text_embeddings = text_embeddings.float()
+
+            # Apply conditioning dropout
+            # Decide for each sample if we drop the caption
+            conditioning_mask = torch.rand(B, device=device) < 0.5
+            if conditioning_mask.any():
+                # Replace conditional embeddings with unconditional embedding for those samples
+                # Expand uncond_emb to batch shape if needed
+                if uncond_emb.size(0) != B:
+                    uncond_batch = uncond_emb.expand(B, -1, -1)  # (B, seq_len, 768)
+                else:
+                    uncond_batch = uncond_emb
+                text_embeddings = torch.where(conditioning_mask.view(B, 1, 1), uncond_batch, text_embeddings)
+
+            guidance = 5.0  # тот же scale, что в pipeline
+            with torch.no_grad(), autocast():  # (fp16 на GPU)
+                # uncond batch (B,77,768)
+                uncond_batch = uncond_emb.expand(B, -1, -1).half()
+                # 1) ε_θ(z_t, "")
+                noise_uncond = teacher_unet(
+                    noisy_latents.half(), timesteps,
+                    encoder_hidden_states=uncond_batch
+                ).sample
+                # 2) ε_θ(z_t, caption)
+                noise_cond = teacher_unet(
+                    noisy_latents.half(), timesteps,
+                    encoder_hidden_states=text_embeddings.half()
+                ).sample
+            # 3) CFG‑таргет  (как при инференсе, но нормализуем масштабы)
+            teacher_pred = noise_uncond + guidance * (noise_cond - noise_uncond)
+            teacher_pred = (teacher_pred / guidance).float()
+
+            student_pred = student_unet(
+                noisy_latents, timesteps, encoder_hidden_states=text_embeddings
+            ).sample
+
+            loss_distill = F.mse_loss(student_pred, teacher_pred)
+            loss_noise = F.mse_loss(student_pred, noise)
+
+          #  alpha = alpha_start + (alpha_end - alpha_start) * (global_step / total_steps)
+            loss = alpha * loss_distill + (1 - alpha) * loss_noise
+
+            loss = loss.float()
+
+            scaler.scale(loss).backward()
+
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(student_unet.parameters(), 1.0)
+
+            scaler.step(optimizer)
+            scaler.update()
+
+            # после scaler.update()
+            for ema_p, p in zip(ema_unet.parameters(), student_unet.parameters()):
+                ema_p.data.mul_(ema_decay).add_(p.data, alpha=1 - ema_decay)
+
+            scheduler.step()
+            optimizer.zero_grad()
+
+            global_step += 1
+
+            if global_step % 50 == 0:
+                print(f"[train] step {global_step}  loss {loss.item():.4f}")
+
+            # Logging and checkpointing
+            if global_step % log_interval == 0:
+                test_prompt = "A group of people shopping at an outdoor market."
+
+                teacher_pipe.unet = teacher_unet
+
+                s_copy = create_student_model()
+                s_copy.load_state_dict(ema_unet.state_dict())
+                s_copy = s_copy.half().eval().to(device)
+                student_pipe = StableDiffusionPipeline(
+                    vae=teacher_vae.half(),
+                    text_encoder=teacher_text_encoder.half(),
+                    tokenizer=tokenizer,
+                    feature_extractor=teacher_pipe.feature_extractor,
+                    unet=s_copy,
+                    scheduler=teacher_pipe.scheduler,
+                    safety_checker=None,
+                ).to(device)
+
+                real_tensors, fake_tensors = [], []
+                for i in range(2):
+                    # генерим teacher @512 и сразу же уменьшаем до 64×64
+                    t_img = teacher_pipe(
+                        test_prompt, num_inference_steps=25, guidance_scale=3
+                    ).images[0]
+                    t_small = t_img.resize((64, 64), Image.BICUBIC)
+                    real_tensors.append(to_tensor01(t_small))
+
+                    s_img = student_pipe(
+                        test_prompt, height=64, width=64,
+                        num_inference_steps=25, guidance_scale=3
+                    ).images[0]
+                    fake_tensors.append(to_tensor01(s_img))
+
+                    # сохраняем student в 512×512 отдельно, если нужно
+                    s_img.resize((512, 512), Image.BICUBIC).save(f"{out_dir}/step_{global_step}_student_{i}.png")
+                    t_img.save(f"{out_dir}/step_{global_step}_teacher_{i}.png")
+                # теперь собираем батчи и считаем FID
+                real_batch = torch.stack(real_tensors).to(device)
+                fake_batch = torch.stack(fake_tensors).to(device)
+                fid.update(real_batch, real=True)
+                fid.update(fake_batch, real=False)
+                fid_val = fid.compute().item()
+                print(f"[train] step {global_step}  FID {fid_val:.4f}")
+                fid.reset()
+
+                student_unet.train()
+
+        # End of epoch: save model checkpoint and sample student outputs
+        torch.save(student_unet.state_dict(), f"student_epoch_{epoch+1}.pt")
+        # Generate a few sample images with student for visual evaluation
+        student_unet.eval()
+        sample_prompts = [
+            "A dog playing with a ball in a park.",
+            "A busy street in New York City at night.",
+            "A bowl of fresh fruits on a kitchen table."
+        ]
+        # ► fp16-копия
+        s_copy = create_student_model()
+        s_copy.load_state_dict(ema_unet.state_dict())
+        s_copy = s_copy.half().eval().to(device)
+
+        student_pipe = StableDiffusionPipeline(
+            vae=teacher_vae.half(),  # уже fp16
+            text_encoder=teacher_text_encoder.half(),
+            tokenizer=tokenizer,
+            feature_extractor=teacher_pipe.feature_extractor,
+            unet=s_copy,
+            scheduler=teacher_pipe.scheduler,
+            safety_checker=None,
+        ).to(device)
+
+        student_pipe.set_progress_bar_config(disable=True)
+        for i, prompt in enumerate(sample_prompts):
+            st_img = student_pipe(prompt, height=64, width=64, num_inference_steps=25, guidance_scale=3).images[0]
+            tea_img = teacher_pipe(prompt, height=512, width=512, num_inference_steps=25, guidance_scale=3).images[0]
+            st_img.save(f"{out_dir}/epoch{epoch + 1}_sample{i + 1}_student.png")
+            tea_img.save(f"{out_dir}/epoch{epoch + 1}_sample{i + 1}_teacher.png")
+
+        student_unet.train()
+        print(f"Epoch {epoch+1} completed, model checkpoint saved.")
+        real_imgs = []
+        fake_imgs = []
+
+        for i in range(len(sample_prompts)):
+            t_path = f"{out_dir}/epoch{epoch + 1}_sample{i + 1}_teacher.png"
+            s_path = f"{out_dir}/epoch{epoch + 1}_sample{i + 1}_student.png"
+            t = Image.open(t_path).resize((64, 64), Image.BICUBIC)
+            s = Image.open(s_path)
+            real_imgs.append(to_tensor01(t))
+            fake_imgs.append(to_tensor01(s))
+
+        real_batch = torch.stack(real_imgs).to(device)
+        fake_batch = torch.stack(fake_imgs).to(device)
+
+        fid.update(real_batch, real=True)
+        fid.update(fake_batch, real=False)
+        epoch_fid = fid.compute()
+
+        print(f"[epoch {epoch + 1}] FID = {epoch_fid:.4f}")
+
+        fid.reset()
+
+
+fid_metric = FrechetInceptionDistance(feature=2048).to(device)
+lpips_fn = lpips.LPIPS(net='alex').to(device)
+
+def compare_models(student_unet, teacher_pipe, prompts, n_steps=50, guidance=7.5):
+
+    teacher_pipe.unet = teacher_unet
+    teacher_pipe.scheduler = DDPMScheduler.from_config(teacher_pipe.scheduler.config)
+    teacher_pipe = teacher_pipe.to(device)
+
+    student_unet_fp16 = student_unet.half().eval()
+    student_pipe = StableDiffusionPipeline(
+        vae              = teacher_vae,
+        text_encoder     = teacher_text_encoder.half(),
+        tokenizer        = tokenizer,
+        feature_extractor= teacher_pipe.feature_extractor,
+        unet             = student_unet_fp16,
+        scheduler        = teacher_pipe.scheduler,
+        safety_checker   = None,
+    ).to(device)
+
+    student_pipe.scheduler = DDPMScheduler.from_config(student_pipe.scheduler.config)
+
+    teacher_images = []
+    student_images = []
+    generator = torch.Generator(device=device).manual_seed(42)
+    for prompt in prompts:
+        teacher_img = teacher_pipe(prompt, height=512, width=512, num_inference_steps=n_steps, guidance_scale=guidance, generator=generator).images[0]
+        student_img = student_pipe(prompt, height=64, width=64, num_inference_steps=n_steps, guidance_scale=guidance, generator=generator).images[0]
+        teacher_img_resized = teacher_img.resize((64, 64))
+        teacher_images.append(teacher_img_resized)
+        student_images.append(student_img)
+
+    teacher_tensors = []
+    student_tensors = []
+    for t_img, s_img in zip(teacher_images, student_images):
+        t_tensor = transforms.ToTensor()(t_img).mul(255).to(torch.uint8)
+        s_tensor = transforms.ToTensor()(s_img).mul(255).to(torch.uint8)
+        teacher_tensors.append(t_tensor)
+        student_tensors.append(s_tensor)
+    teacher_tensors = torch.stack(teacher_tensors).to(device)
+    student_tensors = torch.stack(student_tensors).to(device)
+    fid_metric.reset()
+    fid_metric.update(teacher_tensors, real=True)
+    fid_metric.update(student_tensors, real=False)
+    fid_score = fid_metric.compute().item()
+
+    lpips_scores = []
+    for t_img, s_img in zip(teacher_images, student_images):
+        t_tensor = transforms.ToTensor()(t_img).unsqueeze(0).to(device) * 2 - 1
+        s_tensor = transforms.ToTensor()(s_img).unsqueeze(0).to(device) * 2 - 1
+        with torch.no_grad():
+            lp = lpips_fn(s_tensor, t_tensor)
+        lpips_scores.append(lp.item())
+    avg_lpips = sum(lpips_scores) / len(lpips_scores)
+    print(f"Evaluated on {len(prompts)} prompts – FID: {fid_score:.4f}, LPIPS: {avg_lpips:.4f}")
+    return fid_score, avg_lpips
+
+max_lr = 1e-4
+div_factor = 4
+
+out_cust = "output/custom"
+out_rand = "output/random"
+
+optimizer_rand  = AdamW(student_unet_random.parameters(), lr=max_lr/div_factor)
+optimizer_cust  = AdamW(student_unet_custom.parameters(), lr=max_lr/div_factor)
+steps_per_epoch = len(dataloader)
+total_steps     = 20 * steps_per_epoch  # 20 эпох
+
+scheduler_rand = OneCycleLR(
+    optimizer_rand,
+    max_lr=max_lr,
+    total_steps=total_steps,
+    pct_start=0.1,
+    anneal_strategy="cos",
+    div_factor=div_factor,
+    final_div_factor=25
+)
+scheduler_cust = OneCycleLR(
+    optimizer_cust,
+    max_lr=max_lr,
+    total_steps=total_steps,
+    pct_start=0.1,
+    anneal_strategy="cos",
+    div_factor=div_factor,
+    final_div_factor=25
+)
+
+train_student(student_unet_custom, dataloader, optimizer_cust, scheduler_cust, out_cust, epochs=20)
+train_student(student_unet_random, dataloader, optimizer_rand,  scheduler_rand, out_rand, epochs=20)
+
+
+
+student_unet_random.eval()
+student_unet_custom.eval()
+prompts = [
+    "A cat sitting on a colorful blanket.",
+    "A bustling city street with neon lights at night.",
+    "A serene beach with palm trees during sunset.",
+    "A close-up of a delicious gourmet dish on a plate."
+]
+print("Comparing teacher vs student (random init):")
+fid_rand, lpips_rand = compare_models(student_unet_random, teacher_pipe, prompts)
+print("Comparing teacher vs student (custom init):")
+fid_cust, lpips_cust = compare_models(student_unet_custom, teacher_pipe, prompts)
