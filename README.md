@@ -42,14 +42,18 @@ cd sd-student-distill
 python -m venv .venv        # or conda create ...
 source .venv/bin/activate
 pip install -r requirements.txt
+
 ---
+
 ## Dataset
 wget http://images.cocodataset.org/zips/train2017.zip
 unzip train2017.zip -d data/coco2017/
 
 wget http://images.cocodataset.org/annotations/annotations_trainval2017.zip
 unzip annotations_trainval2017.zip -d data/coco2017/
+
 ---
+
 ## Quick start
 python v2/train_v2.py \
   --teacher runwayml/stable-diffusion-v1-5 \
@@ -65,7 +69,9 @@ python v2/compare_models.py \
   --student_ckpt runs/v2.2_best/epoch20.pt \
   --teacher runwayml/stable-diffusion-v1-5 \
   --prompts_file prompts/val_50.txt
+
 ---
+
 ## Directory layout
 v1/                 # progressive distillation + feature loss
 v2/
