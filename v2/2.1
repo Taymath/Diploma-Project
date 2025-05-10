@@ -55,12 +55,10 @@ dataloader = DataLoader(dataset, batch_size=20, shuffle=True,
                         num_workers=0, pin_memory=True, drop_last=True, collate_fn=coco_collate_fn)
 
 
-# Configurations
 teacher_model_id = "runwayml/stable-diffusion-v1-5"  # Stable Diffusion v1.5 model id
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 num_train_timesteps = 1000  # number of diffusion steps (Stable Diffusion uses 1000)
 
-# Load teacher Stable Diffusion pipeline (half precision to fit in memory)
 teacher_pipe = StableDiffusionPipeline.from_pretrained(
     teacher_model_id,
     torch_dtype=torch.float16,   # ⟵ добавили
@@ -72,7 +70,7 @@ teacher_unet = teacher_pipe.unet  # diffusion model (U-Net)
 teacher_vae = teacher_pipe.vae    # VAE for encoding/decoding images
 teacher_text_encoder = teacher_pipe.text_encoder  # CLIP text encoder
 tokenizer = teacher_pipe.tokenizer                # tokenizer for captions
-# Set teacher models to eval mode (we won't train them)
+
 teacher_unet.eval()
 teacher_vae.eval()
 teacher_text_encoder.eval()
@@ -157,24 +155,23 @@ def initialize_student_weights(teacher_unet_full, student_unet):
     student_unet.load_state_dict(new_state_dict, strict=False)
     return student_unet
 
-# Create student models for comparison: one random, one initialized from teacher
+
 student_unet_random = create_student_model()
 student_unet_custom = create_student_model()
-# Load teacher UNet in full precision on CPU for weight extraction
+
 teacher_unet_full = UNet2DConditionModel.from_pretrained(teacher_model_id, subfolder="unet").to("cpu")
 initialize_student_weights(teacher_unet_full, student_unet_custom)
-# Move student models to training device and set to train mode
+
 student_unet_random = student_unet_random.to(device)
 student_unet_custom = student_unet_custom.to(device)
 student_unet_random.train()
 student_unet_custom.train()
 
-# Set up diffusion noise scheduler for training (DDPM scheduler)
 noise_scheduler = DDPMScheduler(num_train_timesteps=num_train_timesteps, beta_start=0.00085, beta_end=0.0120, beta_schedule="scaled_linear")
 
 def train_student(student_unet, dataloader, optimizer, scheduler, out_dir, epochs=20, log_interval=250):
     """Train the student diffusion model for a given number of epochs."""
-    # FID: InceptionV3 ожидает 299×299 и пиксели в [0..1]
+
     fid = FrechetInceptionDistance(feature=2048, normalize=True).to(device)
     to_tensor01 = transforms.Compose([
             transforms.Resize((299, 299)),
@@ -192,42 +189,34 @@ def train_student(student_unet, dataloader, optimizer, scheduler, out_dir, epoch
     for epoch in range(epochs):
         for batch in dataloader:
             images, captions = batch["image"], batch["caption"]
-            # Resize and normalize images to 64x64 for student
+
             images = [transforms.functional.resize(img, (64, 64)) for img in images]
             images = [transforms.functional.center_crop(img, (64, 64)) for img in images]
-            # Convert images to tensor and normalize to [-1, 1] for VAE
+
             image_tensors = torch.stack([transforms.ToTensor()(img) * 2 - 1 for img in images]).to(device)  # shape (B,3,64,64)
-            # Encode images to latents with VAE
+
             with torch.no_grad():
                 latents_dist = teacher_vae.encode(image_tensors.half())  # encode in fp16
                 latents = latents_dist.latent_dist.mean * 0.18215 # scaled latent
                 latents = latents.float()  # convert to float32 for training
 
-            # Sample random diffusion timesteps for each image in the batch
             B = latents.size(0)
             timesteps = torch.randint(0, noise_scheduler.num_train_timesteps, (B,), device=device).long()
-            # Add noise to latents according to diffusion schedule
             noise = torch.randn_like(latents)
             noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
 
-            # Prepare text condition (with 10% dropout for classifier-free guidance)
             tokenized = tokenizer(list(captions), padding="max_length", truncation=True, max_length=tokenizer.model_max_length, return_tensors="pt")
             text_embeddings = teacher_text_encoder(tokenized.input_ids.to(device), attention_mask=tokenized.attention_mask.to(device)).last_hidden_state.float()
             text_embeddings = text_embeddings.float()
 
-            # Apply conditioning dropout
-            # Decide for each sample if we drop the caption
             conditioning_mask = torch.rand(B, device=device) < 0.1
             if conditioning_mask.any():
-                # Replace conditional embeddings with unconditional embedding for those samples
-                # Expand uncond_emb to batch shape if needed
                 if uncond_emb.size(0) != B:
                     uncond_batch = uncond_emb.expand(B, -1, -1)  # (B, seq_len, 768)
                 else:
                     uncond_batch = uncond_emb
                 text_embeddings = torch.where(conditioning_mask.view(B, 1, 1), uncond_batch, text_embeddings)
 
-            # Predict noise with student model
             model_pred = student_unet(noisy_latents, timesteps, encoder_hidden_states=text_embeddings).sample
             loss = F.mse_loss(model_pred, noise)
 
@@ -251,7 +240,6 @@ def train_student(student_unet, dataloader, optimizer, scheduler, out_dir, epoch
             if global_step % 50 == 0:
                 print(f"[train] step {global_step}  loss {loss.item():.4f}")
 
-            # Logging and checkpointing
             if global_step % log_interval == 0:
                 test_prompt = "A group of people shopping at an outdoor market."
 
@@ -272,7 +260,7 @@ def train_student(student_unet, dataloader, optimizer, scheduler, out_dir, epoch
 
                 real_tensors, fake_tensors = [], []
                 for i in range(2):
-                    # генерим teacher @512 и сразу же уменьшаем до 64×64
+
                     t_img = teacher_pipe(
                         test_prompt, num_inference_steps=25, guidance_scale=7.5
                     ).images[0]
@@ -285,10 +273,9 @@ def train_student(student_unet, dataloader, optimizer, scheduler, out_dir, epoch
                     ).images[0]
                     fake_tensors.append(to_tensor01(s_img))
 
-                    # сохраняем student в 512×512 отдельно, если нужно
                     s_img.resize((512, 512), Image.BICUBIC).save(f"{out_dir}/step_{global_step}_student_{i}.png")
                     t_img.save(f"{out_dir}/step_{global_step}_teacher_{i}.png")
-                # теперь собираем батчи и считаем FID
+
                 real_batch = torch.stack(real_tensors).to(device)
                 fake_batch = torch.stack(fake_tensors).to(device)
                 fid.update(real_batch, real=True)
@@ -299,16 +286,15 @@ def train_student(student_unet, dataloader, optimizer, scheduler, out_dir, epoch
 
                 student_unet.train()
 
-        # End of epoch: save model checkpoint and sample student outputs
         torch.save(student_unet.state_dict(), f"student_epoch_{epoch+1}.pt")
-        # Generate a few sample images with student for visual evaluation
+
         student_unet.eval()
         sample_prompts = [
             "A dog playing with a ball in a park.",
             "A busy street in New York City at night.",
             "A bowl of fresh fruits on a kitchen table."
         ]
-        # ► fp16-копия
+
         s_copy = create_student_model()
         s_copy.load_state_dict(student_unet.state_dict())
         s_copy = s_copy.half().eval().to(device)
@@ -444,8 +430,6 @@ scheduler_cust = OneCycleLR(
 
 train_student(student_unet_custom, dataloader, optimizer_cust, scheduler_cust, out_cust, epochs=20)
 train_student(student_unet_random, dataloader, optimizer_rand,  scheduler_rand, out_rand, epochs=20)
-
-
 
 student_unet_random.eval()
 student_unet_custom.eval()
