@@ -5,12 +5,12 @@ from torch import nn
 from torch.optim import AdamW
 from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms
-# Diffusers and Transformers libraries for Stable Diffusion components
+
 from diffusers import StableDiffusionPipeline, UNet2DConditionModel, AutoencoderKL, DDPMScheduler
 from transformers import CLIPTextModel, CLIPTokenizer
-# Metrics libraries for FID and LPIPS
+
 from torchmetrics.image.fid import FrechetInceptionDistance
-import lpips  # Learned perceptual image patch similarity library
+import lpips 
 from torch.optim.lr_scheduler import OneCycleLR
 from pycocotools.coco import COCO
 from PIL import Image
@@ -55,21 +55,21 @@ dataloader = DataLoader(dataset, batch_size=20, shuffle=True,
                         num_workers=0, pin_memory=True, drop_last=True, collate_fn=coco_collate_fn)
 
 
-teacher_model_id = "runwayml/stable-diffusion-v1-5"  # Stable Diffusion v1.5 model id
+teacher_model_id = "runwayml/stable-diffusion-v1-5" 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-num_train_timesteps = 1000  # number of diffusion steps (Stable Diffusion uses 1000)
+num_train_timesteps = 1000  
 
 teacher_pipe = StableDiffusionPipeline.from_pretrained(
     teacher_model_id,
-    torch_dtype=torch.float16,   # ⟵ добавили
+    torch_dtype=torch.float16, 
     safety_checker=None
 ).to(device)
-teacher_pipe.enable_attention_slicing()  # reduce memory usage for attention
+teacher_pipe.enable_attention_slicing()
 teacher_pipe.vae.half()
-teacher_unet = teacher_pipe.unet  # diffusion model (U-Net)
-teacher_vae = teacher_pipe.vae    # VAE for encoding/decoding images
-teacher_text_encoder = teacher_pipe.text_encoder  # CLIP text encoder
-tokenizer = teacher_pipe.tokenizer                # tokenizer for captions
+teacher_unet = teacher_pipe.unet 
+teacher_vae = teacher_pipe.vae   
+teacher_text_encoder = teacher_pipe.text_encoder 
+tokenizer = teacher_pipe.tokenizer                
 
 teacher_unet.eval()
 teacher_vae.eval()
@@ -78,19 +78,19 @@ teacher_text_encoder.eval()
 
 def create_student_model():
     """Create a student UNet model with reduced blocks/channels."""
-    student_channels = [256, 512, 512]  # Reduced channels for down blocks
+    student_channels = [256, 512, 512]  
     student_down_blocks = ["CrossAttnDownBlock2D", "CrossAttnDownBlock2D", "CrossAttnDownBlock2D"]
     student_up_blocks   = ["CrossAttnUpBlock2D", "CrossAttnUpBlock2D", "CrossAttnUpBlock2D"]
     student_config = {
-        "sample_size": 8,                 # latent spatial size for 64x64 images
-        "in_channels": 4,                 # latent channels (4)
-        "out_channels": 4,                # model predicts noise in latent space (4 channels)
+        "sample_size": 8,                
+        "in_channels": 4,                
+        "out_channels": 4,                
         "down_block_types": student_down_blocks,
         "up_block_types": student_up_blocks,
         "block_out_channels": student_channels,
-        "layers_per_block": 2,            # same as teacher
-        "cross_attention_dim": 768,       # CLIP text embedding dimension
-        "attention_head_dim": 8,          # same head dim as teacher
+        "layers_per_block": 2,          
+        "cross_attention_dim": 768,      
+        "attention_head_dim": 8,          
     }
     student_unet = UNet2DConditionModel(**student_config).to(device)
     return student_unet
@@ -100,7 +100,7 @@ def initialize_student_weights(teacher_unet_full, student_unet):
     Initialize the student model's weights using the teacher model's weights.
     We trim or project teacher weights to student dimensions (using slicing, equivalent to 1x1 conv projections).
     """
-    teacher_state = teacher_unet_full.state_dict()  # full-precision teacher weights
+    teacher_state = teacher_unet_full.state_dict()  
     student_state = student_unet.state_dict()
 
     new_state_dict = {}
@@ -179,7 +179,7 @@ def train_student(student_unet, dataloader, optimizer, scheduler, out_dir, epoch
     ])
     student_unet.train()
     global_step = 0
-    # Pre-compute unconditional text embeddings for classifier-free guidance (empty caption)
+ 
     uncond_tokens = tokenizer(
         [""], padding="max_length", truncation=True, max_length=tokenizer.model_max_length, return_tensors="pt"
     )
@@ -196,9 +196,9 @@ def train_student(student_unet, dataloader, optimizer, scheduler, out_dir, epoch
             image_tensors = torch.stack([transforms.ToTensor()(img) * 2 - 1 for img in images]).to(device)  # shape (B,3,64,64)
 
             with torch.no_grad():
-                latents_dist = teacher_vae.encode(image_tensors.half())  # encode in fp16
-                latents = latents_dist.latent_dist.mean * 0.18215 # scaled latent
-                latents = latents.float()  # convert to float32 for training
+                latents_dist = teacher_vae.encode(image_tensors.half()) 
+                latents = latents_dist.latent_dist.mean * 0.18215 
+                latents = latents.float() 
 
             B = latents.size(0)
             timesteps = torch.randint(0, noise_scheduler.num_train_timesteps, (B,), device=device).long()
@@ -212,7 +212,7 @@ def train_student(student_unet, dataloader, optimizer, scheduler, out_dir, epoch
             conditioning_mask = torch.rand(B, device=device) < 0.1
             if conditioning_mask.any():
                 if uncond_emb.size(0) != B:
-                    uncond_batch = uncond_emb.expand(B, -1, -1)  # (B, seq_len, 768)
+                    uncond_batch = uncond_emb.expand(B, -1, -1)  
                 else:
                     uncond_batch = uncond_emb
                 text_embeddings = torch.where(conditioning_mask.view(B, 1, 1), uncond_batch, text_embeddings)
@@ -300,7 +300,7 @@ def train_student(student_unet, dataloader, optimizer, scheduler, out_dir, epoch
         s_copy = s_copy.half().eval().to(device)
 
         student_pipe = StableDiffusionPipeline(
-            vae=teacher_vae.half(),  # уже fp16
+            vae=teacher_vae.half(),
             text_encoder=teacher_text_encoder.half(),
             tokenizer=tokenizer,
             feature_extractor=teacher_pipe.feature_extractor,
@@ -407,7 +407,7 @@ out_rand = "output/random"
 optimizer_rand  = AdamW(student_unet_random.parameters(), lr=max_lr/div_factor, weight_decay=1e-4)
 optimizer_cust  = AdamW(student_unet_custom.parameters(), lr=max_lr/div_factor, weight_decay=1e-4)
 steps_per_epoch = len(dataloader)
-total_steps     = 20 * steps_per_epoch  # 20 эпох
+total_steps     = 20 * steps_per_epoch  
 
 scheduler_rand = OneCycleLR(
     optimizer_rand,
