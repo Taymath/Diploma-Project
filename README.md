@@ -63,8 +63,8 @@ python v2/train_v2.py \
   --guidance_scale 5 \
   --max_lr 3e-4 --pct_start 0.2 --final_div_factor 10 \
   --alpha_schedule linear --drop_schedule 0.1,0.5 \
-  --out_dir runs/v2.2_best
-#Evaluate against the teacher on a set of prompts:
+  --out_dir runs/v2.2_best\
+#Evaluate against the teacher on a set of prompts:\
 python v2/compare_models.py \
   --student_ckpt runs/v2.2_best/epoch20.pt \
   --teacher runwayml/stable-diffusion-v1-5 \
@@ -73,13 +73,17 @@ python v2/compare_models.py \
 ---
 
 ## Directory layout
-v1/                 # progressive distillation + feature loss
+v1/  v1.1.py                # progressive distillation + feature loss
 v2/
- ├── train_v2.py    # 2.1 / 2.2 main script
- └── ...            # helpers
-v3/                 # Accelerate high-end pipeline
-notebooks/          # exploratory FID plots
-prompts/            # eval prompt sets
-runs/               # checkpoints & logs (ignored by git)
+ ├── v2.1.py    # 2.1 main script
+ └── v2.2.py    # 2.2 main script
+v3/ # Accelerate high-end pipeline
+├── coco_dataset.py
+├── data.py
+├── inference.py
+├── prepare_unet_small.py
+├── requirements.txt
+└── train_student_kd.py
+               
 
 
