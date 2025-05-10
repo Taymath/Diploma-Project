@@ -36,13 +36,23 @@ The repository contains three progressively more advanced training pipelines:
 ---
 
 ## Installation
+Install the required Python packages for V-1, V-2.1, V-2.2:
 ```bash
-git clone https://github.com/yourname/sd-student-distill.git
-cd sd-student-distill
-python -m venv .venv        # or conda create ...
-source .venv/bin/activate
-pip install -r requirements.txt
+
+pip install \
+  torch \
+  torchvision \
+  diffusers \
+  transformers \
+  accelerate \
+  torchmetrics \
+  lpips \
+  pytorch-fid \
+  pycocotools \
+  pillow \
+  tqdm
 ```
+
 ---
 
 ## Dataset
