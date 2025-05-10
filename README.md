@@ -25,7 +25,7 @@ The repository contains three progressively more advanced training pipelines:
 
 ## Features
 
-### V-1 (v1/)
+### V-1 (v1/1.py)
 - **Progressive DDPM schedule**  
   Gradually shortens the diffusion chain during training.
 - **Feature-matching loss**  
@@ -37,7 +37,7 @@ The repository contains three progressively more advanced training pipelines:
 
 ---
 
-### V-2.1 (v2/train_v2.py – “noise-only”)
+### V-2.1 (v2/2.1.py – “noise-only”)
 - **Teacher-to-student slicing**  
   Directly slices teacher UNet tensors to initialize student model.
 - **Standard MSE loss on noise**  
@@ -49,7 +49,7 @@ The repository contains three progressively more advanced training pipelines:
 
 ---
 
-### V-2.2 (v2/train_v2.py – “KD + CFG”)
+### V-2.2 (v2/2.2.py – “KD + CFG”)
 - **Knowledge Distillation term**  
   Adds an MSE loss between student and teacher noise predictions.
 - **Dynamic α-schedule**  
@@ -91,10 +91,10 @@ unzip annotations_trainval2017.zip -d data/coco2017/
 ---
 
 ## Directory layout
-v1/  v1.1.py                # progressive distillation + feature loss\
+v1/  1.py                # progressive distillation + feature loss\
 v2/\
- ├── v2.1.py    # 2.1 main script\
- └── v2.2.py    # 2.2 main script\
+ ├── 2.1.py    # 2.1 main script\
+ └── 2.2.py    # 2.2 main script\
 v3/ # Accelerate high-end pipeline\
 ├── coco_dataset.py\
 ├── data.py\
