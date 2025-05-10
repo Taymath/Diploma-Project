@@ -10,7 +10,7 @@ The repository contains three progressively more advanced training pipelines:
 | `v2/`    | **V-2.2**  | V-2.1 ++ KD term, dynamic α(t) & conditional-dropout | ~310 |
 | `v3/`    | **V-3**    | Accelerate, mixed-precision, `sd_small` / `sd_tiny` pruning | - |
 
-> **TL;DR** &nbsp;V-2.2 (student @ 64×64) reaches **FID ≈ 310** on MS-COCO val (25 DDPM steps, CFG 5) – a **2× improvement** over our baseline &lt; 10 h on a single RTX 3060 6 GB.
+> **TL;DR** &nbsp;V-2.2 (student @ 64×64) reaches **FID ≈ 310** on MS-COCO val (25 DDPM steps, CFG 5) – a **2× improvement** over our baseline &lt; 10 h on a single mobile RTX 3060 6 GB.
 
 ---
 
@@ -18,20 +18,47 @@ The repository contains three progressively more advanced training pipelines:
 1. [Features](#features)
 2. [Installation](#installation)
 3. [Dataset](#dataset)
-4. [Quick start](#quick-start)
-5. [Directory layout](#directory-layout)
+4. [Directory layout](#directory-layout)
 
 
 ---
 
 ## Features
-* **Teacher → Student weight projection** (`initialize_student_weights`) – copies matching tensors, slices the rest.
-* **Progressive/DDPM scheduler** that gradually shortens the diffusion chain.
-* **EMA tracker** for smooth student weights.
-* **On-the-fly metrics:** FID & LPIPS every *n* steps (GPU version, no image dumping).
-* **Condition-free guidance (CFG)** & prompt dropout during training (V-2.2).
-* **Prunable U-Net** (`prepare_unet`) producing `sd_small` / `sd_tiny` models.
-* Single-GPU friendly – all configs tested on < 8 GB VRAM with `torch.float16`.
+
+### V-1 (v1/)
+- **Progressive DDPM schedule**  
+  Gradually shortens the diffusion chain during training.
+- **Feature-matching loss**  
+  Combines noise-matching (MSE) with intermediate layer-wise distillation via hooks.
+- **Adaptive weight projection** (`ConvProjection`)  
+  Copies teacher weights into student, slicing/mapping mismatched channels.
+- **EMA tracker**  
+  Keeps an exponential moving average of student weights for stability.
+
+---
+
+### V-2.1 (v2/train_v2.py – “noise-only”)
+- **Teacher-to-student slicing**  
+  Directly slices teacher UNet tensors to initialize student model.
+- **Standard MSE loss on noise**  
+  Simplified objective: match student noise prediction to true noise.
+- **OneCycleLR scheduler**  
+  Cosine-annealed learning‐rate with warm-up.
+- **Periodic FID & LPIPS evaluation**  
+  On‐the‐fly metrics every N steps (no image dumping).
+
+---
+
+### V-2.2 (v2/train_v2.py – “KD + CFG”)
+- **Knowledge Distillation term**  
+  Adds an MSE loss between student and teacher noise predictions.
+- **Dynamic α-schedule**  
+  Linearly decays the KD weight α(t) from 1→0.5 through training.
+- **Conditional-dropout (CFG mask)**  
+  Gradually increases caption dropout rate to regularize guidance.
+- **All V-2.1 features inherited**  
+  OneCycleLR, teacher slicing, periodic FID/LPIPS.
+
 
 ---
 
