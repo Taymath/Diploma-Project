@@ -8,7 +8,6 @@ The repository contains three progressively more advanced training pipelines:
 | `v1/`    | **V-1**    | progressive DDPM schedule + feature-matching loss | ~600 |
 | `v2/`    | **V-2.1**  | noise–matching (*ε*) + OneCycleLR + periodic FID/LPIPS | ~412 |
 | `v2/`    | **V-2.2**  | V-2.1 ++ KD term, dynamic α(t) & conditional-dropout | ~310 |
-| `v3/`    | **V-3**    | Accelerate, mixed-precision, `sd_small` / `sd_tiny` pruning | - |
 
 > **TL;DR** &nbsp;V-2.2 (student @ 64×64) reaches **FID ≈ 310** on MS-COCO val (25 DDPM steps, CFG 5) – a **2× improvement** over our baseline &lt; 10 h on a single mobile RTX 3060 6 GB.
 
@@ -95,13 +94,6 @@ v1/  1.py                # progressive distillation + feature loss\
 v2/\
  ├── 2.1.py    # 2.1 main script\
  └── 2.2.py    # 2.2 main script\
-v3/ # Accelerate high-end pipeline\
-├── coco_dataset.py\
-├── data.py\
-├── inference.py\
-├── prepare_unet_small.py\
-├── requirements.txt\
-└── train_student_kd.py\
                
 
 
